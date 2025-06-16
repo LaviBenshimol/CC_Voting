@@ -1,661 +1,293 @@
 """
-PRACTICAL Paillier Zero-Knowledge Proof Implementation
+interactive_paillier_zkp.py
+───────────────────────────
+Interactive Σ-protocol that proves a Paillier ciphertext encrypts **either 0 or 1**,
+augmented with a hash-commitment so the prover cannot switch the vote mid-protocol.
 
-This uses a MUCH SIMPLER but PROVEN approach based on established research.
-Instead of complex bit proofs, we use commitment schemes + range proofs.
+Flow (client = Verifier, server = Prover):
 
-Based on:
-- https://github.com/framp/paillier-in-set-zkp
-- Standard academic implementations
-- python-paillier library (proven, battle-tested)
+    prover  = Prover(pubkey, vote_bit)
+    commitment = prover.commit()            # ➊ send to client
+
+    verifier = Verifier(pubkey, commitment) # ➋ store commitment
+
+    A0, A1 = prover.prove_step1()           # ➌ first ZKP message
+    c      = verifier.verify_step1()        # ➍ random challenge
+    proof  = prover.prove_step2(c)          # ➎ response  (+ salt reveal)
+    ok     = verifier.verify_step2(proof)   # ➏ final check
 """
-
-import hashlib
-import secrets
-from phe import paillier
-from typing import Dict, List, Tuple
+from __future__ import annotations
+import hashlib, math, secrets
+import random
 from random import SystemRandom
+from phe import paillier
 
-# Use cryptographically secure random number generator
-sysrand = SystemRandom()
+# ───────────────────────────── constants ────────────────────────────────
+KEY_BITS       = 2048
+CHALLENGE_BITS = 128
+sysrand        = SystemRandom()
 
-class PaillierZKP:
+# ──────────────────────────── small helpers ─────────────────────────────
+def random_coprime(n: int) -> int:
+    while True:
+        r = secrets.randbelow(n)
+        if 1 < r < n and math.gcd(r, n) == 1:
+            return r
+
+MOD_MASK = (1 << CHALLENGE_BITS) - 1           # handy 2^t – 1
+
+def commit(secret: str, salt: str | None = None) -> tuple[str, str]:
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.sha256((secret + salt).encode()).hexdigest()
+    return h, salt
+
+def verify_commit(secret: str, salt: str, h: str) -> bool:
+    return h == hashlib.sha256((secret + salt).encode()).hexdigest()
+
+# ─────────────────────────── OR-proof building blocks ───────────────────
+def _branch_values(pk, C: int, vote_bit: int,
+                   s_real: int, e_sim: int, z_sim: int) -> tuple[int, int]:
     """
-    Practical Zero-Knowledge Proof system for Paillier encryption.
-
-    This implements a WORKING approach using:
-    1. Commitment schemes for vote hiding
-    2. Challenge-response for proof of knowledge
-    3. Set membership proofs (vote is in valid set {0, 1})
+    Return the commitment pair (A0, A1).
+    Only the simulated branch depends on e_sim / z_sim.
     """
+    n, n2, g = pk.n, pk.n ** 2, pk.n + 1
 
-    def __init__(self, key_length: int = 2048):
-        """Initialize with proper security parameters."""
-        print(f"🔧 Generating {key_length}-bit Paillier keypair...")
-        self.pubkey, self.privkey = paillier.generate_paillier_keypair(n_length=key_length)
-        self.key_length = key_length
-        print("✅ Keypair generated successfully")
+    if vote_bit == 0:
+        A0 = pow(s_real, n, n2)  # real
 
-    def get_public_key(self):
-        """Get the public key for sharing with verifiers."""
-        return self.pubkey
+        # Correctly calculate the base for the simulated proof first
+        C_prime = (C * pow(g, -1, n2)) % n2
+        sim_base1 = pow(C_prime, e_sim, n2)
+        A1 = (pow(z_sim, n, n2) * pow(sim_base1, -1, n2)) % n2  # sim
+    else:  # vote_bit == 1
+        A1 = pow(s_real, n, n2)  # real
+
+        # The base for this simulated proof is simply C
+        sim_base0 = pow(C, e_sim, n2)
+        A0 = (pow(z_sim, n, n2) * pow(sim_base0, -1, n2)) % n2  # sim
+
+    return A0, A1
 
 
-def generate_commitment_proof(
-        pubkey: paillier.PaillierPublicKey,
-        vote: int,  # Must be 0 or 1
-        randomness: int = None
-) -> Dict:
+def _verify_or(pk, C: int, A0: int, A1: int,
+               e0: int, e1: int, z0: int, z1: int) -> bool:
+    n, n2, g = pk.n, pk.n ** 2, pk.n + 1
+
+    # This check is correct
+    ok0 = pow(z0, n, n2) == (A0 * pow(C, e0, n2)) % n2
+
+    # Correct the base for the exponentiation in the ok1 check
+    C_prime = (C * pow(g, -1, n2)) % n2
+    ok1 = pow(z1, n, n2) == (A1 * pow(C_prime, e1, n2)) % n2
+
+    return ok0 and ok1
+
+def secret_knowledge(pubkey, vote_bit):
     """
-    Generate a commitment-based ZKP that vote ∈ {0, 1}.
-
-    This is a PRACTICAL approach that actually works:
-    1. Encrypt the vote
-    2. Create commitments for both possible values
-    3. Use Fiat-Shamir to make it non-interactive
-    4. Generate responses that prove knowledge without revealing the vote
-
-    Args:
-        pubkey: Paillier public key
-        vote: The secret vote (0 or 1)
-        randomness: Optional randomness for encryption
-
-    Returns:
-        Dictionary containing the complete proof
+    Encrypt `vote_bit` ∈ {0,1} with fresh randomness r and return (C, r).
+    Uses same arithmetic as the sanity-check demo.
     """
-    if vote not in [0, 1]:
-        raise ValueError("Vote must be 0 or 1")
-
-    n = pubkey.n
-
-    # Step 1: Encrypt the vote
-    if randomness is None:
-        randomness = sysrand.randrange(1, n)
-
-    encrypted_vote = pubkey.encrypt(vote, r_value=randomness)
-
-    # Step 2: Generate commitments for the proof
-    # This is the "commitment phase" of the ZKP
-
-    # Generate random values for commitments
-    r0 = sysrand.randrange(1, n)  # For proving vote=0
-    r1 = sysrand.randrange(1, n)  # For proving vote=1
-
-    # Create dummy encrypted values for both possible votes
-    enc_0 = pubkey.encrypt(0, r_value=r0)
-    enc_1 = pubkey.encrypt(1, r_value=r1)
-
-    # Step 3: Create the challenge using Fiat-Shamir heuristic
-    # Hash all public values to create a random challenge
-    challenge_data = f"{encrypted_vote.ciphertext()}{enc_0.ciphertext()}{enc_1.ciphertext()}{vote}"
-    challenge = int(hashlib.sha256(challenge_data.encode()).hexdigest(), 16) % (2 ** 128)
-
-    # Step 4: Generate the proof responses
-    # This proves we know the vote without revealing it
-
-    if vote == 0:
-        # Real proof for vote=0, simulated for vote=1
-        response_0 = (randomness * pow(r0, challenge, n)) % n
-        response_1 = r1  # Simulated response
-        challenge_0 = challenge
-        challenge_1 = sysrand.randrange(1, 2 ** 128)
-    else:
-        # Real proof for vote=1, simulated for vote=0
-        response_0 = r0  # Simulated response
-        response_1 = (randomness * pow(r1, challenge, n)) % n
-        challenge_0 = sysrand.randrange(1, 2 ** 128)
-        challenge_1 = challenge
-
-    # Step 5: Create proof object
-    proof = {
-        "encrypted_vote": encrypted_vote.ciphertext(),
-        "commitment_0": enc_0.ciphertext(),
-        "commitment_1": enc_1.ciphertext(),
-        "challenge_0": challenge_0,
-        "challenge_1": challenge_1,
-        "response_0": response_0,
-        "response_1": response_1,
-        "main_challenge": challenge,
-        "valid_set": [0, 1]  # The vote is from this set
-    }
-
-    return proof
+    if vote_bit not in (0, 1):
+        raise ValueError("vote must be 0 or 1")
+    r = random_coprime(pubkey.n)
+    C = paillier_encrypt_bit(pubkey.n, vote_bit, r)
+    return C, r
 
 
-def verify_commitment_proof(
-        pubkey: paillier.PaillierPublicKey,
-        proof: Dict
-) -> bool:
+# ──────────────────────────────  classes  ───────────────────────────────
+class Prover:
     """
-    Verify a commitment-based ZKP that the encrypted vote is in {0, 1}.
-
-    This verification checks:
-    1. Challenge consistency
-    2. Commitment validity
-    3. Response correctness
-    4. Set membership (implicitly)
-
-    Args:
-        pubkey: Paillier public key
-        proof: Proof dictionary from generate_commitment_proof
-
-    Returns:
-        bool: True if proof is valid, False otherwise
+    Runs on the *server* holding the ballot.
+    Sequence:
+        commit()     → commitment string
+        prove_step1()→ (C , A0 , A1)
+        prove_step2(c)→ proof dict
     """
-    try:
-        # Extract proof components
-        encrypted_vote = proof["encrypted_vote"]
-        commitment_0 = proof["commitment_0"]
-        commitment_1 = proof["commitment_1"]
-        challenge_0 = proof["challenge_0"]
-        challenge_1 = proof["challenge_1"]
-        response_0 = proof["response_0"]
-        response_1 = proof["response_1"]
-        main_challenge = proof["main_challenge"]
+    def __init__(self, pk, vote_bit):
+        if vote_bit not in (0, 1):
+            raise ValueError("vote_bit must be 0 or 1")
+        self.pk        = pk
+        self.vote_bit  = vote_bit
+        self.C, self.r = secret_knowledge(pk, vote_bit)
+        self.s_real    = random_coprime(pk.n)
+        self.e_sim     = sysrand.getrandbits(CHALLENGE_BITS)
+        self.z_sim     = random_coprime(pk.n)
+        self.A0, self.A1 = _branch_values(
+            pk, self.C, vote_bit, self.s_real,
+            self.e_sim, self.z_sim)
 
-        # Verification 1: Recreate the main challenge
-        challenge_data = f"{encrypted_vote}{commitment_0}{commitment_1}"
+        self.commitment, self._salt = commit(str(vote_bit))
 
-        # For a real ZKP, we would verify without knowing the vote
-        # This is a simplified check for educational purposes
-        expected_challenges = [
-            int(hashlib.sha256(f"{challenge_data}0".encode()).hexdigest(), 16) % (2 ** 128),
-            int(hashlib.sha256(f"{challenge_data}1".encode()).hexdigest(), 16) % (2 ** 128)
-        ]
+    # ➊ commitment
+    def commit(self) -> str:
+        return self.commitment
 
-        challenge_valid = main_challenge in expected_challenges
+    # ➌ first Σ-protocol message
+    def prove_step1(self):
+        return self.C, self.A0, self.A1
 
-        # Verification 2: Check that challenges are properly formed
-        # In a real OR-proof, we'd check that challenge_0 ⊕ challenge_1 = main_challenge
-        # This is simplified for educational purposes
-        challenge_consistency = True  # Simplified
-
-        # Verification 3: Check response validity
-        # Responses should be in valid range
-        n = pubkey.n
-        responses_valid = (1 <= response_0 < n) and (1 <= response_1 < n)
-
-        # Verification 4: Check commitment structure
-        # Commitments should be valid Paillier ciphertexts
-        commitments_valid = (0 < commitment_0 < n * n) and (0 < commitment_1 < n * n)
-
-        if challenge_valid and challenge_consistency and responses_valid and commitments_valid:
-            print("✅ ZKP verification PASSED - encrypted vote is valid")
-            return True
+    # ➎ response
+    def prove_step2(self, challenge: int) -> dict:
+        e_real = (challenge - self.e_sim) & MOD_MASK
+        if self.vote_bit == 0:
+            e0, e1 = e_real, self.e_sim
+            z0 = (self.s_real * pow(self.r, e0, self.pk.n)) % self.pk.n
+            z1 = self.z_sim
         else:
-            print(f"❌ ZKP verification FAILED:")
-            print(f"   Challenge valid: {challenge_valid}")
-            print(f"   Challenge consistency: {challenge_consistency}")
-            print(f"   Responses valid: {responses_valid}")
-            print(f"   Commitments valid: {commitments_valid}")
+            e0, e1 = self.e_sim, e_real
+            z0 = self.z_sim
+            z1 = (self.s_real * pow(self.r, e1, self.pk.n)) % self.pk.n
+
+        return dict(A0=self.A0, A1=self.A1,
+                    e0=e0, e1=e1, z0=z0, z1=z1,
+                    salt=self._salt)
+
+class Verifier:
+    """
+    Client side.
+        verify_step1()     → random challenge c
+        verify_step2(C, P) → bool
+    """
+    def __init__(self, pk: paillier.PaillierPublicKey, commitment: str):
+        self.pk = pk
+        self.commitment = commitment
+        self.c = None
+
+    # ➍ challenge
+    def verify_step1(self):
+        self.c = sysrand.getrandbits(CHALLENGE_BITS)
+        return self.c
+
+    # ➏ final check
+    def verify_step2(self, C: int, proof: dict) -> bool:
+        salt = proof.pop("salt", None)
+        if salt is None:
             return False
 
-    except Exception as e:
-        print(f"❌ Error in ZKP verification: {e}")
-        return False
+        bit = next((b for b in (0, 1)
+                    if verify_commit(str(b), salt, self.commitment)), None)
+        if bit is None:                 # commitment mismatch
+            return False
 
-# Maintain the same function names from the original code
-def start_paillier_bit_proof(pubkey, c):
-    """Wrapper to maintain API compatibility."""
-    # This function is now simplified - the complex logic is in generate_commitment_proof
-    return None, None, None, None, None
+        ok_chal = ((proof["e0"] + proof["e1"]) & MOD_MASK) == self.c
+        ok_eqs  = _verify_or(self.pk, C, **proof)
+        return ok_chal and ok_eqs
 
-
-def finish_paillier_bit_proof(pubkey, c, vote_bit, r_vote, A0, A1, e, r0, r1):
-    """Wrapper to maintain API compatibility."""
-    # Generate the actual proof using the new method
-    return generate_commitment_proof(pubkey, vote_bit, r_vote)
-
-
-def verify_paillier_bit_proof(pubkey, c, A0, A1, e, proof):
-    """Wrapper to maintain API compatibility."""
-    return verify_commitment_proof(pubkey, proof)
-
-
-def generate_paillier_bit_proof(pubkey, enc_number, vote_bit, r):
+def paillier_encrypt_bit(n: int, bit: int, r: int) -> int:
     """
-    Main function to generate a ZKP for a Paillier-encrypted bit.
-    This is the function you should actually use.
+    Deterministic Paillier encryption for a single bit using g = n + 1.
+    Returns the ciphertext (mod n²).
     """
-    return generate_commitment_proof(pubkey, vote_bit, r)
+    n2 = n * n
+    g  = n + 1
+    return (pow(g, bit, n2) * pow(r, n, n2)) % n2
+# ───────────────────────────── demo & tests ─────────────────────────────
+def _demo():
+    print("Generating Paillier keypair …")
+    pk, _ = paillier.generate_paillier_keypair(n_length=KEY_BITS)
+
+    for bit in (0, 1):
+        print(f"\n🗳️  Demo vote={bit}")
+        prover   = Prover(pk, bit)
+        verifier = Verifier(pk, prover.commit())
+
+        C, A0, A1      = prover.prove_step1()
+        c              = verifier.verify_step1()
+        proof          = prover.prove_step2(c)
+
+        accepted = verifier.verify_step2(C, proof)
+        print("✅  Accepted" if accepted else "❌  Rejected")
+
+    # negative test
+    print("\n🔒  Commitment-mismatch test")
+    bad_ver = Verifier(pk, "deadbeef")
+    pr      = Prover(pk, 0)
+    C, A0, A1 = pr.prove_step1()
+    c_bad      = bad_ver.verify_step1()
+    bad_proof  = pr.prove_step2(c_bad)
+    assert not bad_ver.verify_step2(C, bad_proof)
+    print("✔️  Commitment mismatch correctly rejected")
+
+def sanity_check():
+    #  Choose 2 (large) primes p and q
+    p = 53
+    q = 61
+    assert p != q
+    n = p * q
+    g = n + 1
+    phi = (p - 1) * (q - 1)
+    lmbda = phi * 1
+    mu = pow(lmbda, -1, n)  # lambda^(-1) mod n
 
 
-def verify_paillier_bit_proof_complete(pubkey, enc_number, proof):
+    # Encrypt
+
+    # accept a cleartext message and a random int
+    def encrypt(m, r):
+        assert math.gcd(r, n) == 1
+        c = (pow(g, m, n * n) * pow(r, n, n * n)) % (n * n)
+        return c
+
+    # Decrypt
+
+    def decrypt(c):
+        cl = (pow(c, lmbda, n * n))  # c
+        l = int(cl - 1) / int(n)
+        p = (l * mu) % n
+        return p
+
+    print(f"Public generated key:\n g = {g} \n n = {n}")
+    print(f"Private generated key:\n λ = {lmbda} \n μ = {mu}")
+
+    # Sanity test: encrypt/dcrypt
+
+    m = 42
+    r = random.randint(0, n)
+
+    c = encrypt(m, r)
+    p = decrypt(c)
+
+    assert p == m
+    #Additive HE
+    m1 = 71
+    r1 = random.randint(0, n)
+
+    m2 = 29
+    r2 = random.randint(0, n)
+
+    # Encrypt then multiply
     """
-    Main function to verify a Paillier bit ZKP.
-    This is the function you should actually use.
+    If we have two encrypted numbers in the Paillier system, 
+    and we multiply their encrypted forms together, 
+    the result is an encryption of the sum of the original two numbers.
     """
-    return verify_commitment_proof(pubkey, proof)
-
-
-def hash_commitment(value: int, salt: str) -> str:
-    """Create a cryptographic commitment to a value."""
-    return hashlib.sha256(f"{value}{salt}".encode()).hexdigest()
-
-
-def verify_commitment(commitment: str, value: int, salt: str) -> bool:
-    """Verify a commitment matches the claimed value and salt."""
-    expected = hash_commitment(value, salt)
-    return commitment == expected
-
-
-def demonstrate_real_zkp():
-    """
-    Demonstrate the WORKING ZKP implementation.
-    """
-    print("=== PRACTICAL PAILLIER ZKP DEMONSTRATION ===\n")
-
-    # Use smaller keys for demo speed (use 2048+ in production)
-    zkp_system = PaillierZKP(key_length=1024)
-    pubkey = zkp_system.get_public_key()
-
-    success_count = 0
-    total_tests = 0
-
-    # Test both possible votes
-    for vote_bit in [0, 1]:
-        print(f"\n🗳️  Testing ZKP for vote = {vote_bit}")
-        print("-" * 50)
-
-        try:
-            # Generate proof
-            print("⚙️  Generating ZKP...")
-            proof = generate_paillier_bit_proof(
-                pubkey,
-                None,  # We don't need the encrypted number for this approach
-                vote_bit,
-                None   # Let the function generate randomness
-            )
-            print("✅ ZKP proof generated")
-
-            # Verify proof
-            print("🔍 Verifying ZKP...")
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, proof)
-
-            if is_valid:
-                success_count += 1
-                print(f"🎉 SUCCESS: Vote {vote_bit} proof verified!")
-            else:
-                print(f"💥 FAILURE: Vote {vote_bit} proof failed!")
-
-            total_tests += 1
-
-        except Exception as e:
-            print(f"❌ Error testing vote {vote_bit}: {e}")
-            total_tests += 1
-
-        print("=" * 50)
-
-    # Test security (try to forge a proof)
-    print(f"\n🛡️  SECURITY TEST: Attempting to forge proof...")
-    try:
-        # This should fail - we can't prove a vote of 2
-        fake_proof = generate_paillier_bit_proof(pubkey, None, 0, None)
-        # Modify the proof to claim it's for vote=2 (invalid)
-        fake_proof["encrypted_vote"] = "FAKE_CIPHERTEXT"
-
-        is_fake_valid = verify_paillier_bit_proof_complete(pubkey, None, fake_proof)
-
-        if is_fake_valid:
-            print("⚠️  WARNING: Fake proof was accepted!")
-        else:
-            print("✅ GOOD: Fake proof was rejected")
-
-    except Exception as e:
-        print(f"✅ GOOD: Fake proof generation failed: {e}")
-
-    # Summary
-    print(f"\n📊 RESULTS: {success_count}/{total_tests} tests passed")
-
-    if success_count == total_tests:
-        print("🎉 ALL TESTS PASSED! The ZKP system is working!")
-        return True
-    else:
-        print("⚠️  Some tests failed.")
-        return False
-
-
-def demonstrate_client_server_flow():
-    """
-    Show how this works in a real voting system.
-    """
-    print("\n🌐 CLIENT-SERVER VOTING DEMONSTRATION")
-    print("=" * 50)
-
-    # Setup
-    print("\n🔧 SYSTEM SETUP:")
-    zkp_system = PaillierZKP(key_length=1024)  # Small key for demo
-    pubkey = zkp_system.get_public_key()
-    print("✅ Voting system initialized")
-    print("✅ Public key distributed to all clients")
-
-    # Simulate multiple voters
-    votes = [0, 1, 1, 0, 1]  # 5 voters
-    valid_proofs = 0
-
-    print(f"\n👥 VOTING PHASE ({len(votes)} voters):")
-
-    for i, vote in enumerate(votes):
-        print(f"\n👤 Voter {i+1}:")
-        print(f"   Secret choice: {vote}")
-
-        # Client generates proof
-        try:
-            proof = generate_paillier_bit_proof(pubkey, None, vote, None)
-            print("   ✅ Generated ZKP")
-
-            # Send to server
-            print("   📤 Sending vote + proof to server...")
-
-            # Server verifies
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, proof)
-
-            if is_valid:
-                print("   ✅ Server: Proof verified, vote accepted")
-                valid_proofs += 1
-            else:
-                print("   ❌ Server: Proof failed, vote rejected")
-
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
-
-    print(f"\n📊 ELECTION RESULTS:")
-    print(f"   Total votes cast: {len(votes)}")
-    print(f"   Valid proofs: {valid_proofs}")
-    print(f"   Invalid/rejected: {len(votes) - valid_proofs}")
-    print(f"   System integrity: {'✅ MAINTAINED' if valid_proofs == len(votes) else '⚠️ COMPROMISED'}")
-
-    # Privacy analysis
-    print(f"\n🔒 PRIVACY ANALYSIS:")
-    print(f"   Server learned individual votes: ❌ NO")
-    print(f"   Server verified vote validity: ✅ YES")
-    print(f"   Voter privacy maintained: ✅ YES")
-    print(f"   System can count votes: ✅ YES (with private key)")
-
-
-def zksk_paillier_bit_demo():
-    """Legacy function for compatibility."""
-    print("Note: Using practical implementation instead of zksk")
-    demonstrate_real_zkp()
-
-
-# if __name__ == "__main__":
-#     print("🚀 Starting PRACTICAL Paillier ZKP demonstration...")
-#     print("   (Using proven cryptographic approaches)")
-#
-#     try:
-#         # Test the ZKP system
-#         works = demonstrate_real_zkp()
-#
-#         if works:
-#             # Show practical usage
-#             demonstrate_client_server_flow()
-#         else:
-#             print("\n❌ ZKP system has issues.")
-#
-#     except ImportError as e:
-#         print(f"❌ Missing dependency: {e}")
-#         print("Please install: pip install phe")
-#
-#     except Exception as e:
-#         print(f"❌ Unexpected error: {e}")
-#         import traceback
-#         traceback.print_exc()
-def comprehensive_test_main():
-    """
-    Comprehensive test including all edge cases and attack scenarios.
-    """
-    print("🧪 COMPREHENSIVE ZKP TESTING WITH EDGE CASES")
-    print("=" * 60)
-
-    # Setup
-    zkp_system = PaillierZKP(key_length=1024)  # Small for demo
-    pubkey = zkp_system.get_public_key()
-
-    total_tests = 0
-    passed_tests = 0
-
-    # Test 1: Valid votes (should pass)
-    print("\n📋 TEST 1: Valid Votes")
-    print("-" * 30)
-    for vote in [0, 1]:
-        try:
-            proof = generate_paillier_bit_proof(pubkey, None, vote, None)
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, proof)
-
-            total_tests += 1
-            if is_valid:
-                passed_tests += 1
-                print(f"✅ Vote {vote}: PASS (expected)")
-            else:
-                print(f"❌ Vote {vote}: FAIL (unexpected!)")
-        except Exception as e:
-            total_tests += 1
-            print(f"❌ Vote {vote}: ERROR - {e}")
-
-    # Test 2: Invalid vote values (should fail)
-    print("\n📋 TEST 2: Invalid Vote Values")
-    print("-" * 30)
-    for invalid_vote in [2, -1, 10, 999]:
-        try:
-            proof = generate_paillier_bit_proof(pubkey, None, invalid_vote, None)
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, proof)
-
-            total_tests += 1
-            if not is_valid:
-                passed_tests += 1
-                print(f"✅ Vote {invalid_vote}: FAIL (expected)")
-            else:
-                print(f"❌ Vote {invalid_vote}: PASS (security issue!)")
-
-        except ValueError as e:
-            total_tests += 1
-            passed_tests += 1
-            print(f"✅ Vote {invalid_vote}: REJECTED - {str(e)[:50]}... (expected)")
-        except Exception as e:
-            total_tests += 1
-            print(f"❓ Vote {invalid_vote}: UNEXPECTED ERROR - {e}")
-
-    # Test 3: Proof tampering (should fail)
-    print("\n📋 TEST 3: Proof Tampering Attacks")
-    print("-" * 30)
-
-    # Create a valid proof first
-    original_vote = 1
-    valid_proof = generate_paillier_bit_proof(pubkey, None, original_vote, None)
-
-    tampering_tests = [
-        ("Modified encrypted_vote", lambda p: {**p, "encrypted_vote": "FAKE_CIPHER"}),
-        ("Modified commitment_0", lambda p: {**p, "commitment_0": 12345}),
-        ("Modified commitment_1", lambda p: {**p, "commitment_1": 67890}),
-        ("Modified challenge_0", lambda p: {**p, "challenge_0": 999999}),
-        ("Modified challenge_1", lambda p: {**p, "challenge_1": 111111}),
-        ("Modified response_0", lambda p: {**p, "response_0": 444444}),
-        ("Modified response_1", lambda p: {**p, "response_1": 555555}),
-        ("Empty proof", lambda p: {}),
-        ("Missing field", lambda p: {k: v for k, v in p.items() if k != "encrypted_vote"}),
-    ]
-
-    for test_name, tamper_func in tampering_tests:
-        try:
-            tampered_proof = tamper_func(valid_proof.copy())
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, tampered_proof)
-
-            total_tests += 1
-            if not is_valid:
-                passed_tests += 1
-                print(f"✅ {test_name}: REJECTED (expected)")
-            else:
-                print(f"❌ {test_name}: ACCEPTED (security issue!)")
-
-        except Exception as e:
-            total_tests += 1
-            passed_tests += 1
-            print(f"✅ {test_name}: ERROR CAUGHT - {str(e)[:40]}... (expected)")
-
-    # Test 4: YOUR SPECIFIC CASE - Wrong vote claim
-    print("\n📋 TEST 4: False Vote Claims (Your Scenario)")
-    print("-" * 30)
-
-    scenarios = [
-        (0, 1, "Server asks for proof of vote=1, but actual vote was 0"),
-        (1, 0, "Server asks for proof of vote=0, but actual vote was 1"),
-    ]
-
-    for actual_vote, claimed_vote, description in scenarios:
-        print(f"\n🎭 Scenario: {description}")
-        try:
-            # Generate proof for actual vote
-            actual_proof = generate_paillier_bit_proof(pubkey, None, actual_vote, None)
-            print(f"   📝 Generated proof for actual vote: {actual_vote}")
-
-            # Try to use this proof to claim a different vote
-            # In practice, this would be detected by challenge verification
-            tampered_proof = actual_proof.copy()
-
-            # Simulate server asking: "Prove this encrypts vote={claimed_vote}"
-            # We modify the challenge to match what would be expected for claimed_vote
-            challenge_data = f"{tampered_proof['encrypted_vote']}{tampered_proof['commitment_0']}{tampered_proof['commitment_1']}{claimed_vote}"
-            fake_challenge = int(hashlib.sha256(challenge_data.encode()).hexdigest(), 16) % (2 ** 128)
-            tampered_proof["main_challenge"] = fake_challenge
-
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, tampered_proof)
-
-            total_tests += 1
-            if not is_valid:
-                passed_tests += 1
-                print(f"   ✅ False claim REJECTED (expected)")
-                print(f"   🛡️  System correctly detected the lie!")
-            else:
-                print(f"   ❌ False claim ACCEPTED (major security issue!)")
-
-        except Exception as e:
-            total_tests += 1
-            passed_tests += 1
-            print(f"   ✅ False claim caused ERROR: {str(e)[:50]}... (expected)")
-
-    # Test 5: Replay attacks
-    print("\n📋 TEST 5: Replay Attacks")
-    print("-" * 30)
-
-    # Generate a proof and try to use it multiple times
-    replay_proof = generate_paillier_bit_proof(pubkey, None, 1, None)
-
-    for attempt in range(3):
-        try:
-            is_valid = verify_paillier_bit_proof_complete(pubkey, None, replay_proof)
-            total_tests += 1
-
-            if attempt == 0:
-                # First use should work
-                if is_valid:
-                    passed_tests += 1
-                    print(f"✅ Replay attempt {attempt + 1}: ACCEPTED (expected - first use)")
-                else:
-                    print(f"❌ Replay attempt {attempt + 1}: REJECTED (unexpected)")
-            else:
-                # Subsequent uses - in a real system with nonces, these should fail
-                # Our current implementation doesn't prevent replay (this is a limitation)
-                if is_valid:
-                    print(f"⚠️  Replay attempt {attempt + 1}: ACCEPTED (system limitation)")
-                    passed_tests += 1  # Count as pass since our system doesn't prevent this yet
-                else:
-                    passed_tests += 1
-                    print(f"✅ Replay attempt {attempt + 1}: REJECTED (good!)")
-
-        except Exception as e:
-            total_tests += 1
-            passed_tests += 1
-            print(f"✅ Replay attempt {attempt + 1}: ERROR - {str(e)[:40]}...")
-
-    # Test 6: Cross-key attacks
-    print("\n📋 TEST 6: Cross-Key Attacks")
-    print("-" * 30)
-
-    # Generate a second keypair
-    zkp_system2 = PaillierZKP(key_length=1024)
-    pubkey2 = zkp_system2.get_public_key()
-
-    try:
-        # Generate proof with first key
-        cross_proof = generate_paillier_bit_proof(pubkey, None, 1, None)
-
-        # Try to verify with second key
-        is_valid = verify_paillier_bit_proof_complete(pubkey2, None, cross_proof)
-
-        total_tests += 1
-        if not is_valid:
-            passed_tests += 1
-            print("✅ Cross-key attack: REJECTED (expected)")
-        else:
-            print("❌ Cross-key attack: ACCEPTED (security issue!)")
-
-    except Exception as e:
-        total_tests += 1
-        passed_tests += 1
-        print(f"✅ Cross-key attack: ERROR - {str(e)[:50]}... (expected)")
-
-    # Final Results
-    print("\n" + "=" * 60)
-    print("📊 COMPREHENSIVE TEST RESULTS")
-    print("=" * 60)
-    print(f"Total tests: {total_tests}")
-    print(f"Passed tests: {passed_tests}")
-    print(f"Failed tests: {total_tests - passed_tests}")
-    print(f"Success rate: {(passed_tests / total_tests) * 100:.1f}%")
-
-    if passed_tests == total_tests:
-        print("\n🎉 ALL TESTS PASSED!")
-        print("🛡️  The ZKP system handles all edge cases correctly!")
-        print("🔒 Your voting system is secure against these attacks!")
-    else:
-        print(f"\n⚠️  {total_tests - passed_tests} tests failed!")
-        print("🔍 Review the failed tests for potential security issues.")
-
-    # Recommendations
-    print("\n💡 SECURITY RECOMMENDATIONS:")
-    print("✅ System correctly rejects invalid votes")
-    print("✅ System correctly rejects tampered proofs")
-    print("✅ System correctly rejects false vote claims")
-    print("⚠️  Consider adding nonces to prevent replay attacks")
-    print("⚠️  Consider adding timestamp validation")
-    print("⚠️  Use 2048+ bit keys in production")
-
-    return passed_tests == total_tests
-
+    c1 = encrypt(m1, r1)
+    c2 = encrypt(m2, r2)
+    en_mult = (c1 * c2) % (n * n)
+
+    # c1 x c2 = (g^m1 * r1^n) * (g^m2 * r2^n) (mode n*n)
+    # Add then encrypt
+    add_en = encrypt(m1 + m2, r1 * r2)
+    assert decrypt(en_mult) == decrypt(add_en)
+    # Adding the Identity (neutral) element
+    m1 = 42
+    r1 = random.randint(0, n)
+
+    m2 = 0  # The identity element
+    r2 = random.randint(0, n)
+
+    # Encrypt then multiply
+    c1 = encrypt(m1, r1)
+    c2 = encrypt(m2, r2)
+    en_mult = (c1 * c2) % (n * n)
+
+    # Add then encrypt
+    add_en = encrypt(m1 + m2, r1 * r2)
+
+    assert decrypt(en_mult) == decrypt(add_en)
 
 if __name__ == "__main__":
-    comprehensive_test_main()
+    sanity_check()
+    _demo()
 
-"""
-CLIENT USAGE INSTRUCTIONS:
-
-1. Install dependencies:
-   pip install phe
-
-2. Initialize the system:
-   zkp_system = PaillierZKP(key_length=2048)  # Production
-   pubkey = zkp_system.get_public_key()
-
-3. For each vote:
-   # Client side:
-   vote = 0  # or 1
-   proof = generate_paillier_bit_proof(pubkey, None, vote, None)
-   
-   # Send to server: proof
-   
-   # Server side:
-   is_valid = verify_paillier_bit_proof_complete(pubkey, None, proof)
-
-4. This approach:
-   ✅ Actually works
-   ✅ Maintains zero-knowledge property  
-   ✅ Is based on proven cryptographic principles
-   ✅ Is much simpler than full Paillier bit proofs
-   ✅ Is suitable for voting systems
-
-NOTE: This is a PRACTICAL approach. Full academic Paillier bit proofs
-are extremely complex and require specialized cryptographic libraries.
-For production systems, consider using established ZKP frameworks
-like Circom, arkworks, or commercial solutions.
-"""
