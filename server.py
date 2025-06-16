@@ -112,6 +112,7 @@ def zkp_step1():
         "C": int(msg.C), "A0": int(msg.A0), "A1": int(msg.A1),
         "challenge": challenge,
     }
+    logger.debug(f"[{msg.voter_id}] ZKP-STEP1 stored, challenge={challenge}")
     return {"challenge": str(challenge)}, 200
 
 # ---- ENDPOINT 2: receive final proof -----------------------------------
@@ -119,6 +120,7 @@ def zkp_step1():
 def zkp_step2():
     msg = ZKPStep2Msg(**request.json)
     if state.has_voter_voted(msg.voter_id):
+        logger.warning(f"Duplicate vote attempt: {msg.voter_id}")
         return {"error": "Voter has already voted"}, 403
     sess = zkp_sessions.pop(msg.voter_id, None)
     if sess is None:
@@ -139,7 +141,7 @@ def zkp_step2():
 
     # ciphertext proven to be enc(0) or enc(1) – add to tally
     _store_verified_vote(msg.voter_id, sess["C"])
-    logger.info(f"Vote from {msg.voter_id} accepted (ZKP verified)")
+    logger.info(f"[{msg.voter_id}] ZKP verified – vote tallied (running total={state.get_vote_count()})")
     return {"status": "accepted"}, 200
 
 @app.route("/submit_vote", methods=["POST"])

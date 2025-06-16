@@ -18,7 +18,10 @@ from config import CLIENT_PORT, SERVER_URL, LOG_FORMAT, LOG_LEVEL, REGISTERED_VO
 # Configure logging
 logging.basicConfig(format=LOG_FORMAT, level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
+SIM_OK = True      # global flag – flipped if any scripted test really passes
 
+def green(txt): return f"\033[92m{txt}\033[0m"
+def red(txt):   return f"\033[91m{txt}\033[0m"
 app = Flask(__name__)
 sysrand = SystemRandom()
 
@@ -111,6 +114,7 @@ def cast_vote():
     C, A0, A1  = prover.prove_step1()            # ➌
 
     # ─── 3) send step-1 to server, receive challenge --------------------
+    logger.debug(f"[{voter_id}] → /zkp/step1  (C={C})")
     step1 = dict(
         voter_id   = voter_id,
         commitment = commitment,
@@ -121,6 +125,7 @@ def cast_vote():
         return {"error": f"server rejected ZKP step-1: {r1.json()}"}, 500
 
     challenge = int(r1.json()["challenge"])
+    logger.debug(f"[{voter_id}] ← challenge {challenge}")
 
     # ─── 4) compute response & send step-2 ------------------------------
     proof = prover.prove_step2(challenge)        # ➎
@@ -130,6 +135,8 @@ def cast_vote():
         z0 = str(proof["z0"]),  z1 = str(proof["z1"]),
         salt = proof["salt"],
     )
+    logger.debug(f"[{voter_id}] → /zkp/step2  (e0={proof['e0']}, e1={proof['e1']})")
+
     r2 = requests.post(f"{SERVER_URL}/zkp/step2", json=step2, timeout=10)
     if r2.status_code != 200:
         return {"error": f"server rejected ZKP step-2: {r2.json()}"}, 500
