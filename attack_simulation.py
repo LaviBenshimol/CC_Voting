@@ -4,7 +4,7 @@ ENHANCED SIMULATION WITH INTEGRATED SECURITY TESTING
 This modifies your original simulation.py to include security vulnerability testing.
 Run this instead of your original simulation.py to see the attacks in action.
 """
-
+import shutil
 import threading
 import time
 import logging
@@ -15,6 +15,9 @@ import hashlib
 import secrets
 from flask import Flask
 from random import SystemRandom
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from typing import Tuple
 
 import paillier_zkp
 from paillier_zkp import verify_paillier_bit_proof_complete, CHALLENGE_BITS
@@ -52,19 +55,52 @@ import server
 import client
 
 sysrand = SystemRandom()
+import ssl, tempfile, subprocess, os, atexit
 
+def make_ephemeral_cert() -> Tuple[str, str]:
+    """
+    Create a throw-away RSA key + self-signed cert (CN=localhost).
+    Returns (cert_path, key_path).  Files are deleted on exit.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="tls_demo_")
+    cert   = os.path.join(tmpdir, "cert.pem")
+    key    = os.path.join(tmpdir, "key.pem")
+
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-days", "2", "-nodes",
+            "-subj", "/CN=localhost",
+            "-keyout", key, "-out", cert,
+        ],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    # clean-up on process exit
+    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    return cert, key
+
+cert_path, key_path = make_ephemeral_cert()
 
 def run_server():
-    """Run the server in a thread."""
-    logger.info(f"Starting server on port {SERVER_PORT}")
-    server.app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, use_reloader=False)
-
+    logger.info(f"Starting server on https://localhost:{SERVER_PORT}")
+    server.app.run(
+        host="0.0.0.0",
+        port=SERVER_PORT,
+        ssl_context=(cert_path, key_path),
+        debug=False,
+        use_reloader=False,
+    )
 
 def run_client():
-    """Run the client in a thread."""
-    logger.info(f"Starting client on port {CLIENT_PORT}")
-    client.app.run(host="0.0.0.0", port=CLIENT_PORT, debug=False, use_reloader=False)
-
+    logger.info(f"Starting client on https://localhost:{CLIENT_PORT}")
+    client.app.run(
+        host="0.0.0.0",
+        port=CLIENT_PORT,
+        ssl_context=(cert_path, key_path),
+        debug=False,
+        use_reloader=False,
+    )
 
 def run_normal_simulation():
     """Your original voting simulation (slightly modified for clarity)."""
@@ -78,7 +114,8 @@ def run_normal_simulation():
         # 1. Initialize the system
         logger.info("STEP 1: System Initialization")
         logger.info("-" * 30)
-        response = requests.post(f"{CLIENT_URL}/initialize")
+        response = requests.post(f"{CLIENT_URL}/initialize",
+            verify=False)
         if response.status_code != 200:
             logger.error(f"Failed to initialize: {response.text}")
             return False
@@ -103,7 +140,8 @@ def run_normal_simulation():
             logger.info(f"\nProcessing {voter_id}:")
             response = requests.post(
                 f"{CLIENT_URL}/cast_vote",
-                json={"voter_id": voter_id, "pin": pin, "vote": vote}
+                json={"voter_id": voter_id, "pin": pin, "vote": vote},
+                verify=False
             )
             if response.status_code == 200:
                 logger.info(f"  [OK] Authenticated")
@@ -120,7 +158,7 @@ def run_normal_simulation():
         # 3. Get tally
         logger.info("\nSTEP 3: Tallying Phase")
         logger.info("-" * 30)
-        response = requests.get(f"{CLIENT_URL}/decrypt_tally")
+        response = requests.get(f"{CLIENT_URL}/decrypt_tally",verify=False)
         if response.status_code == 200:
             tally = response.json()
             logger.info("[OK] Retrieved encrypted sum from server")
@@ -142,7 +180,8 @@ def run_normal_simulation():
         logger.info("Testing duplicate vote detection...")
         response = requests.post(
             f"{CLIENT_URL}/cast_vote",
-            json={"voter_id": "voter001", "pin": "alice123", "vote": "no"}
+            json={"voter_id": "voter001", "pin": "alice123", "vote": "no"},
+            verify=False
         )
         if response.status_code != 200:
             logger.info("✓ Duplicate vote correctly rejected")

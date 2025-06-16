@@ -51,6 +51,9 @@ def random_coprime(n: int) -> int:
 MOD_MASK = (1 << CHALLENGE_BITS) - 1           # handy 2^t – 1
 
 def commit(secret: str, salt: str | None = None) -> tuple[str, str]:
+    # salt = salt or secrets.token_hex(16)
+    # h = hashlib.sha256((secret + salt).encode()).hexdigest()
+    # return h, salt
     salt = salt or secrets.token_hex(16)
     h = hashlib.sha256((secret + salt).encode()).hexdigest()
     return h, salt
@@ -121,18 +124,19 @@ class Prover:
     def __init__(self, pk, vote_bit):
         if vote_bit not in (0, 1):
             raise ValueError("vote_bit must be 0 or 1")
-        self.pk        = pk
-        self.vote_bit  = vote_bit
+        self.pk = pk
+        self.vote_bit = vote_bit
         self.C, self.r = secret_knowledge(pk, vote_bit)
-        self.s_real    = random_coprime(pk.n)
-        self.e_sim     = sysrand.getrandbits(CHALLENGE_BITS)
-        self.z_sim     = random_coprime(pk.n)
+
+        # --- commit AFTER C is known so we hide the vote bit --------------
+        self.commitment, self._salt = commit(str(self.C))
+
+        self.s_real = random_coprime(pk.n)
+        self.e_sim = sysrand.getrandbits(CHALLENGE_BITS)
+        self.z_sim = random_coprime(pk.n)
         self.A0, self.A1 = _branch_values(
             pk, self.C, vote_bit, self.s_real,
             self.e_sim, self.z_sim)
-
-        self.commitment, self._salt = commit(str(vote_bit))
-
     # ➊ commitment
     def commit(self) -> str:
         return self.commitment
@@ -179,14 +183,14 @@ class Verifier:
         if salt is None:
             return False
 
-        bit = next((b for b in (0, 1)
-                    if verify_commit(str(b), salt, self.commitment)), None)
-        if bit is None:                 # commitment mismatch
+        # --- NEW: verify commitment binds to ciphertext, not the bit -----
+        if not verify_commit(str(C), salt, self.commitment):
             return False
 
         ok_chal = ((proof["e0"] + proof["e1"]) & MOD_MASK) == self.c
         ok_eqs  = _verify_or(self.pk, C, **proof)
         return ok_chal and ok_eqs
+
 
 def paillier_encrypt_bit(n: int, bit: int, r: int) -> int:
     """

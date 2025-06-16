@@ -9,12 +9,14 @@ voter registry used across the voting system.
 # Server configuration
 SERVER_HOST = "localhost"
 SERVER_PORT = 5000
-SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
+# SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
+SERVER_URL = "https://localhost:5000"
 
 # Client configuration
 CLIENT_HOST = "localhost"
 CLIENT_PORT = 5001
-CLIENT_URL = f"http://{CLIENT_HOST}:{CLIENT_PORT}"
+# CLIENT_URL = f"http://{CLIENT_HOST}:{CLIENT_PORT}"
+CLIENT_URL = "https://localhost:5001"
 
 # Voter Registry - Hardcoded for simulation
 REGISTERED_VOTERS = {

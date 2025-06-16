@@ -73,7 +73,8 @@ def initialize_client():
         # Register public key with server
         response = requests.post(
             f"{SERVER_URL}/set_public_key",
-            json={"n": str(state.pubkey.n)}
+            json={"n": str(state.pubkey.n)},
+            verify=False
         )
 
         if response.status_code == 200:
@@ -120,7 +121,8 @@ def cast_vote():
         commitment = commitment,
         C  = str(C),  A0 = str(A0),  A1 = str(A1),
     )
-    r1 = requests.post(f"{SERVER_URL}/zkp/step1", json=step1, timeout=10)
+    r1 = requests.post(f"{SERVER_URL}/zkp/step1", json=step1,
+            verify=False, timeout=10)
     if r1.status_code != 200:
         return {"error": f"server rejected ZKP step-1: {r1.json()}"}, 500
 
@@ -137,7 +139,8 @@ def cast_vote():
     )
     logger.debug(f"[{voter_id}] → /zkp/step2  (e0={proof['e0']}, e1={proof['e1']})")
 
-    r2 = requests.post(f"{SERVER_URL}/zkp/step2", json=step2, timeout=10)
+    r2 = requests.post(f"{SERVER_URL}/zkp/step2", json=step2,
+            verify=False, timeout=10)
     if r2.status_code != 200:
         return {"error": f"server rejected ZKP step-2: {r2.json()}"}, 500
 
@@ -158,7 +161,7 @@ def decrypt_tally():
 
     try:
         # Get encrypted tally from server
-        response = requests.get(f"{SERVER_URL}/get_encrypted_tally")
+        response = requests.get(f"{SERVER_URL}/get_encrypted_tally",verify=False)
         if response.status_code != 200:
             raise Exception(f"Failed to get tally: {response.json()}")
 
