@@ -15,6 +15,8 @@ import hashlib
 import secrets
 from flask import Flask
 from random import SystemRandom
+from paillier_zkp import verify_paillier_bit_proof_complete
+
 from phe import paillier
 
 # Your original config imports
@@ -268,7 +270,6 @@ def run_security_attack_simulation():
                 )
 
                 # Test the ZKP verification (simulating server verification)
-                from paillier_zkp import verify_paillier_bit_proof_complete
                 is_accepted = verify_paillier_bit_proof_complete(
                     attack_pubkey, encrypted_invalid, malicious_proof
                 )
@@ -307,9 +308,6 @@ def run_security_attack_simulation():
                 false_proof, encrypted_vote = create_false_claim_zkp(
                     attack_pubkey, actual_vote, claimed_vote
                 )
-
-                # Test verification
-                from paillier_zkp import verify_paillier_bit_proof_complete
                 is_accepted = verify_paillier_bit_proof_complete(
                     attack_pubkey, encrypted_vote, false_proof
                 )
@@ -344,7 +342,6 @@ def run_security_attack_simulation():
                 )
 
                 # Test if this would be accepted
-                from paillier_zkp import verify_paillier_bit_proof_complete
                 is_accepted = verify_paillier_bit_proof_complete(
                     attack_pubkey, encrypted_fake, fake_proof
                 )
@@ -465,7 +462,11 @@ def run_security_attack_simulation():
         logger.info(f"Successful attacks: {successful_attacks}")
         logger.info(f"Attack success rate: {(successful_attacks / max(total_attacks, 1)) * 100:.1f}%")
 
-        if successful_attacks > 0:
+        if successful_attacks == 0:
+            logger.info("\n✅ All attacks were successfully prevented!")
+            logger.info("The current ZKP implementation resisted every scripted attack.")
+
+        else:
             logger.error(f"\n🚨🚨🚨 CRITICAL SECURITY FAILURE! 🚨🚨🚨")
             logger.error(f"The zero-knowledge proof implementation is COMPLETELY BROKEN!")
             logger.error(f"\nATTACKERS CAN:")
@@ -481,60 +482,6 @@ def run_security_attack_simulation():
             logger.error(f"3. Use proven cryptographic libraries (Circom, Bulletproofs)")
             logger.error(f"4. Conduct professional security audit")
             logger.error(f"5. Implement formal verification of cryptographic protocols")
-
-        else:
-            logger.info(f"\n✅ All attacks were successfully prevented!")
-            logger.info(f"The ZKP implementation appears to be working correctly.")
-            logger.info(f"(This would be surprising given the code analysis)")
-
-        # Technical explanation
-        logger.info(f"\n" + "=" * 60)
-        logger.info("TECHNICAL ANALYSIS: WHY THESE ATTACKS WORK")
-        logger.info("=" * 60)
-        logger.info(f"""
-🔍 ROOT CAUSE ANALYSIS:
-
-1. FLAWED CHALLENGE VERIFICATION:
-   Current: challenge ∈ {{hash(data+0), hash(data+1)}}
-   Should be: challenge = hash(data+actual_encrypted_vote)
-
-   The verifier accepts ANY challenge that could be valid for 
-   vote 0 OR vote 1, without checking which one is actually encrypted.
-
-2. MISSING OR-PROOF CONSTRAINT:
-   Real OR-proofs require: challenge_0 ⊕ challenge_1 = main_challenge
-   Your implementation doesn't enforce this critical relationship.
-
-3. NO PLAINTEXT-CIPHERTEXT BINDING:
-   The proof doesn't cryptographically link the claimed vote value
-   to the actual encrypted content. Attacker can encrypt X but 
-   prove they encrypted Y.
-
-4. SIMULATION BRANCH VULNERABILITIES:
-   Simulated proof branches use random values instead of properly
-   computed responses that make fake branches indistinguishable.
-
-5. LACK OF SOUNDNESS:
-   A sound ZKP should make it impossible to prove false statements.
-   Your implementation allows proving false statements with high probability.
-
-🛠️  PROPER SOLUTIONS:
-
-A) Use established ZKP libraries:
-   - Circom/snarkjs for zk-SNARKs
-   - Bulletproofs for range proofs  
-   - libsnark for academic implementations
-
-B) Implement proper Sigma protocols:
-   - Cramer-Damgård-Schoenmakers OR-proofs
-   - Proper Fiat-Shamir transformation
-   - Formal soundness and zero-knowledge proofs
-
-C) Add additional security layers:
-   - Commitment schemes with binding
-   - Timestamping and nonce protection
-   - Multi-party computation for tallying
-        """)
 
     except Exception as e:
         logger.error(f"Security attack simulation failed: {e}")

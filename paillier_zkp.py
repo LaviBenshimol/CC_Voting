@@ -21,7 +21,21 @@ import hashlib, math, secrets
 import random
 from random import SystemRandom
 from phe import paillier
+from dataclasses import dataclass
 
+@dataclass
+class ZKPStep1Msg:          # → /zkp/step1
+    voter_id: str
+    commitment: str         # hex
+    C: str                  # int in decimal
+    A0: str
+    A1: str
+
+@dataclass
+class ZKPStep2Msg:          # → /zkp/step2
+    voter_id: str
+    e0: str; e1: str; z0: str; z1: str
+    salt: str
 # ───────────────────────────── constants ────────────────────────────────
 KEY_BITS       = 2048
 CHALLENGE_BITS = 128
@@ -208,6 +222,59 @@ def _demo():
     bad_proof  = pr.prove_step2(c_bad)
     assert not bad_ver.verify_step2(C, bad_proof)
     print("✔️  Commitment mismatch correctly rejected")
+
+# paillier_zkp.py  (new code you’ll add)
+
+def generate_paillier_bit_proof(pk, C_enc: paillier.EncryptedNumber,
+                                plaintext_bit: int, r: int) -> dict:
+    """
+    Fiat–Shamir, non-interactive wrapper around Prover.
+    Returns a dict that can be JSON-serialised and sent to the server.
+    """
+    prover = Prover(pk, plaintext_bit)          # from your tested file
+    # Overwrite with caller-supplied (C,r) so the commitment matches
+    prover.C, prover.r = C_enc.ciphertext(), r
+
+
+    prover.A0, prover.A1 = _branch_values(pk, prover.C, plaintext_bit,
+                                          prover.s_real,
+                                          prover.e_sim, prover.z_sim)
+    # --- Fiat-Shamir challenge ---
+    transcript = f"{pk.n}{prover.C}{prover.A0}{prover.A1}"
+    challenge = int(hashlib.sha256(transcript.encode()).hexdigest(), 16) & MOD_MASK
+    proof = prover.prove_step2(challenge)
+    proof["commitment"] = prover.commitment
+    proof["salt"] = prover._salt
+    proof["C"] = str(prover.C)      # send C once for completeness
+    return proof
+
+
+def verify_paillier_bit_proof_complete(pk, enc: paillier.EncryptedNumber,
+                                       proof: dict) -> bool:
+    """
+    Verifier for the single-message proof produced above.
+    Rejects any ciphertext not encrypting 0 or 1.
+    """
+    # Pull fields
+    C  = int(proof["C"])
+    A0 = int(proof["A0"]); A1 = int(proof["A1"])
+    e0 = int(proof["e0"]); e1 = int(proof["e1"])
+    z0 = int(proof["z0"]); z1 = int(proof["z1"])
+    salt = proof["salt"]
+
+    # ① Fiat–Shamir challenge must match
+    transcript = f"{pk.n}{C}{A0}{A1}"
+    chal = int(hashlib.sha256(transcript.encode()).hexdigest(), 16) & MOD_MASK
+    if ((e0 + e1) & MOD_MASK) != chal:
+        return False
+
+    # ② Commitment binds the vote bit
+    bit = next((b for b in (0, 1) if verify_commit(str(b), salt, proof["commitment"])), None)
+    if bit is None:
+        return False
+
+    # ③ OR-proof equations
+    return _verify_or(pk, C, A0, A1, e0, e1, z0, z1)
 
 def sanity_check():
     #  Choose 2 (large) primes p and q

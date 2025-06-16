@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 from phe import paillier
 import requests
 from random import SystemRandom
-from paillier_zkp import finish_paillier_bit_proof, generate_paillier_bit_proof
+from paillier_zkp import generate_paillier_bit_proof, ZKPStep1Msg, ZKPStep2Msg, Prover
 from config import CLIENT_PORT, SERVER_URL, LOG_FORMAT, LOG_LEVEL, REGISTERED_VOTERS
 
 # Configure logging
@@ -87,130 +87,56 @@ def initialize_client():
         logger.error(f"Failed to initialize client: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/cast_vote", methods=["POST"])
+@app.post("/cast_vote")
 def cast_vote():
     """
-    Cast a vote for an authenticated voter.
-
-    Expected JSON: {
-        "voter_id": "voter001",
-        "pin": "alice123",
-        "vote": "yes" or "no"
-    }
+    REST endpoint called by the simulation.
+    Body JSON:
+        { "voter_id": "voter123", "vote": "yes" | "no" | 1 | 0 }
     """
-    if not state.pubkey:
-        return jsonify({"error": "Client not initialized"}), 400
+    data      = request.get_json(force=True)
+    voter_id  = data.get("voter_id")
+    vote_raw  = data.get("vote")
 
-    data = request.get_json()
-    required_fields = ["voter_id", "pin", "vote"]
-
-    if not data or not all(field in data for field in required_fields):
-        return jsonify({"error": f"Missing required fields: {required_fields}"}), 400
-
-    voter_id = data["voter_id"]
-    pin = data["pin"]
-    vote_str = data["vote"].lower()
-
-    # Authenticate voter
-    if not authenticate_voter(voter_id, pin):
-        logger.warning(f"Authentication failed for {voter_id}")
-        return jsonify({"error": "Invalid voter ID or PIN"}), 401
-
-    # Validate vote
-    if vote_str not in ["yes", "no"]:
-        return jsonify({"error": "Vote must be 'yes' or 'no'"}), 400
-
-    vote_int = 1 if vote_str == "yes" else 0
-
+    # ─── 1) sanitise & map to bit ───────────────────────────────────────
+    vote_map  = {"yes": 1, "no": 0, True: 1, False: 0}
     try:
-        # Step 1: Encrypt the vote
-        r_i = sysrand.randrange(1, state.pubkey.n)
-        enc_vote = state.pubkey.encrypt(vote_int, r_value=r_i)
+        vote_bit = int(vote_raw) if isinstance(vote_raw, int) else vote_map[vote_raw]
+    except (KeyError, ValueError):
+        return {"error": f"invalid vote value: {vote_raw!r}"}, 400
 
-        # Store randomness and vote for later use
-        state.vote_randomness[voter_id] = r_i
-        state.vote_records[voter_id] = vote_int
+    # ─── 2) build prover -------------------------------------------------
+    prover = Prover(state.pubkey, vote_bit)      # generates C, r, etc.
+    commitment = prover.commit()                 # ➊
+    C, A0, A1  = prover.prove_step1()            # ➌
 
-        # Step 2: Generate zero-knowledge proof
-        proof = generate_paillier_bit_proof(
-            state.pubkey, enc_vote, vote_int, r_i
-        )
+    # ─── 3) send step-1 to server, receive challenge --------------------
+    step1 = dict(
+        voter_id   = voter_id,
+        commitment = commitment,
+        C  = str(C),  A0 = str(A0),  A1 = str(A1),
+    )
+    r1 = requests.post(f"{SERVER_URL}/zkp/step1", json=step1, timeout=10)
+    if r1.status_code != 200:
+        return {"error": f"server rejected ZKP step-1: {r1.json()}"}, 500
 
-        # Step 3: Submit encrypted vote to server with proof
-        vote_payload = {
-            "voter_id": voter_id,
-            "ciphertext": str(enc_vote.ciphertext()),
-            "exponent": enc_vote.exponent,
-            "proof": proof  # Send the proof as a nested object
-        }
+    challenge = int(r1.json()["challenge"])
 
-        response = requests.post(f"{SERVER_URL}/submit_vote", json=vote_payload)
-        if response.status_code != 200:
-            raise Exception(f"Server rejected vote: {response.json()}")
+    # ─── 4) compute response & send step-2 ------------------------------
+    proof = prover.prove_step2(challenge)        # ➎
+    step2 = dict(
+        voter_id = voter_id,
+        e0 = str(proof["e0"]),  e1 = str(proof["e1"]),
+        z0 = str(proof["z0"]),  z1 = str(proof["z1"]),
+        salt = proof["salt"],
+    )
+    r2 = requests.post(f"{SERVER_URL}/zkp/step2", json=step2, timeout=10)
+    if r2.status_code != 200:
+        return {"error": f"server rejected ZKP step-2: {r2.json()}"}, 500
 
-        logger.info(f"Vote submitted for {voter_id}")
+    logger.info(f"✅ Vote accepted for {voter_id}")
+    return {"status": "success"}, 200
 
-        # Step 4: Generate and submit commitment
-        salt = os.urandom(16).hex()
-        commitment = hashlib.sha256(f"{vote_int}{salt}".encode()).hexdigest()
-
-        commit_payload = {
-            "voter_id": voter_id,
-            "commitment": commitment,
-            "salt": salt
-        }
-
-        response = requests.post(f"{SERVER_URL}/submit_commitment", json=commit_payload)
-        if response.status_code != 200:
-            raise Exception(f"Server rejected commitment: {response.json()}")
-
-        logger.info(f"Commitment submitted for {voter_id}")
-
-        # Step 5: Perform zero-knowledge proof (for API compatibility)
-        zkp_result = perform_zkp(voter_id, vote_payload)
-
-        if zkp_result["success"]:
-            logger.info(f"Vote successfully cast for {voter_id}")
-            return jsonify({
-                "status": "success",
-                "message": "Vote cast successfully",
-                "voter_id": voter_id,
-                "zkp_verified": True
-            }), 200
-        else:
-            raise Exception("Zero-knowledge proof protocol failed")
-
-    except Exception as e:
-        logger.error(f"Failed to cast vote for {voter_id}: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-def perform_zkp(voter_id: str, vote_payload: dict) -> dict:
-    """
-    Perform zero-knowledge proof protocol with the server.
-
-    With the new commitment-based proof system, the proof is already
-    verified during vote submission. This function is kept for API compatibility.
-    """
-    try:
-        # Start proof protocol (compatibility call)
-        response = requests.get(f"{SERVER_URL}/start_proof?voter_id={voter_id}")
-        if response.status_code != 200:
-            return {"success": False, "error": "Failed to start proof"}
-
-        # The proof was already verified during vote submission
-        # Just call finish_proof for API compatibility
-        proof_payload = {"voter_id": voter_id}
-        response = requests.post(f"{SERVER_URL}/finish_proof", json=proof_payload)
-
-        if response.status_code == 200:
-            return {"success": True}
-        else:
-            return {"success": False, "error": response.json()}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 @app.route("/decrypt_tally", methods=["GET"])

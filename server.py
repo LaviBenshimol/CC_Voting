@@ -9,25 +9,31 @@ proofs for vote validity.
 import logging
 from flask import Flask, request, jsonify
 from phe import paillier
-from paillier_zkp import start_paillier_bit_proof, verify_paillier_bit_proof, verify_paillier_bit_proof_complete
+from typing import Dict
+
+from paillier_zkp import verify_paillier_bit_proof_complete, ZKPStep1Msg, ZKPStep2Msg, CHALLENGE_BITS, Verifier
 from config import SERVER_PORT, LOG_FORMAT, LOG_LEVEL, REGISTERED_VOTERS
+from random import SystemRandom
+
+sysrand = SystemRandom()                 # cryptographically strong RNG
 
 # Configure logging
 logging.basicConfig(format=LOG_FORMAT, level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
+zkp_sessions: Dict[str, dict] = {}  # voter_id -> {"commitment":..., "C":..., "A0":..., "A1":..., "challenge":int}
 # Global state
 class VotingServerState:
     """Maintains the server's global state for the voting system."""
 
     def __init__(self):
         self.pubkey = None
-        self.encrypted_sum = None
+        self.encrypted_sum = 0
         self.received_votes = {}  # voter_id -> encrypted vote data
         self.received_commitments = {}  # voter_id -> commitment data
         self.proof_sessions = {}  # voter_id -> ZKP session data
+
 
     def reset(self):
         """Reset the server state for a new election."""
@@ -82,6 +88,59 @@ def set_public_key():
         logger.error(f"Failed to initialize public key: {e}")
         return jsonify({"error": str(e)}), 400
 
+def _store_verified_vote(voter_id: str, ciphertext_int: int):
+    """
+    Add an already-verified enc(0/1) to the running tally and bookkeeping.
+    """
+    encrypted_vote = paillier.EncryptedNumber(state.pubkey, ciphertext_int, 0)
+    state.encrypted_sum = state.encrypted_sum + encrypted_vote
+    state.received_votes[voter_id] = {
+        "ciphertext": ciphertext_int,
+        "exponent": 0
+    }
+# ---- ENDPOINT 1: receive commitment + (C,A0,A1) ------------------------
+@app.post("/zkp/step1")
+def zkp_step1():
+    msg = ZKPStep1Msg(**request.json)
+    if msg.voter_id in zkp_sessions:
+        return {"error": "session already open"}, 400
+
+    # store everything, issue challenge
+    challenge = sysrand.getrandbits(CHALLENGE_BITS)
+    zkp_sessions[msg.voter_id] = {
+        "commitment": msg.commitment,
+        "C": int(msg.C), "A0": int(msg.A0), "A1": int(msg.A1),
+        "challenge": challenge,
+    }
+    return {"challenge": str(challenge)}, 200
+
+# ---- ENDPOINT 2: receive final proof -----------------------------------
+@app.post("/zkp/step2")
+def zkp_step2():
+    msg = ZKPStep2Msg(**request.json)
+    if state.has_voter_voted(msg.voter_id):
+        return {"error": "Voter has already voted"}, 403
+    sess = zkp_sessions.pop(msg.voter_id, None)
+    if sess is None:
+        return {"error": "no such session"}, 400
+
+    # rebuild proof dict for Verifier
+    proof = dict(
+        A0=sess["A0"], A1=sess["A1"],
+        e0=int(msg.e0), e1=int(msg.e1),
+        z0=int(msg.z0), z1=int(msg.z1),
+        salt=msg.salt,
+    )
+
+    verifier = Verifier(state.pubkey, sess["commitment"])   # <— use state.pubkey
+    verifier.c = sess["challenge"]                          # reuse challenge
+    if not verifier.verify_step2(sess["C"], proof):
+        return {"error": "invalid proof"}, 400
+
+    # ciphertext proven to be enc(0) or enc(1) – add to tally
+    _store_verified_vote(msg.voter_id, sess["C"])
+    logger.info(f"Vote from {msg.voter_id} accepted (ZKP verified)")
+    return {"status": "accepted"}, 200
 
 @app.route("/submit_vote", methods=["POST"])
 def submit_vote():
@@ -122,9 +181,8 @@ def submit_vote():
         exponent = int(data["exponent"])
         encrypted_vote = paillier.EncryptedNumber(state.pubkey, ciphertext, exponent)
 
-        proof_fields = ["encrypted_vote", "commitment_0", "commitment_1",
-                       "challenge_0", "challenge_1", "response_0", "response_1",
-                       "main_challenge", "valid_set"]
+        proof_fields = ["C", "A0", "A1", "e0", "e1", "z0", "z1",
+                        "commitment", "salt"]
 
         # Extract proof from the data - it might be embedded directly or in a 'proof' field
         proof = {}
@@ -168,37 +226,6 @@ def submit_vote():
         return jsonify({"error": str(e)}), 400
 
 
-@app.route("/submit_commitment", methods=["POST"])
-def submit_commitment():
-    """
-    Submit a vote commitment for later verification.
-
-    Expected JSON: {
-        "voter_id": "voter001",
-        "commitment": "<hash-string>",
-        "salt": "<salt-string>"
-    }
-    """
-    data = request.get_json()
-    required_fields = ["voter_id", "commitment", "salt"]
-
-    if not data or not all(field in data for field in required_fields):
-        return jsonify({"error": f"Missing required fields: {required_fields}"}), 400
-
-    voter_id = data["voter_id"]
-
-    # Store commitment
-    state.received_commitments[voter_id] = {
-        "commitment": data["commitment"],
-        "salt": data["salt"]
-    }
-
-    logger.info(f"Commitment received from {voter_id}")
-    return jsonify({
-        "status": "success",
-        "message": "Commitment recorded"
-    }), 200
-
 
 @app.route("/get_encrypted_tally", methods=["GET"])
 def get_encrypted_tally():
@@ -216,65 +243,8 @@ def get_encrypted_tally():
     return jsonify(response), 200
 
 
-@app.route("/start_proof", methods=["GET"])
-def start_proof():
-    """
-    Start zero-knowledge proof protocol for a voter.
-
-    Query parameter: voter_id
-    """
-    voter_id = request.args.get("voter_id")
-
-    if not voter_id:
-        return jsonify({"error": "Missing voter_id parameter"}), 400
-
-    if voter_id not in state.received_votes:
-        return jsonify({"error": "No vote found for voter"}), 404
-
-    try:
-        # With the new commitment-based proof system, this is simplified
-        # The actual proof was already verified during vote submission
-        # This endpoint is kept for API compatibility
-
-        logger.info(f"ZKP protocol compatibility endpoint called for {voter_id}")
-        return jsonify({
-            "A0": "0",
-            "exp_A0": 0,
-            "A1": "0",
-            "exp_A1": 0,
-            "e": "0",
-            "message": "Using commitment-based proof system - proof already verified"
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Failed to start ZKP for {voter_id}: {e}")
-        return jsonify({"error": str(e)}), 400
 
 
-@app.route("/finish_proof", methods=["POST"])
-def finish_proof():
-    """
-    Complete zero-knowledge proof verification.
-
-    This endpoint is kept for API compatibility but the actual
-    proof verification happens during vote submission now.
-    """
-    data = request.get_json()
-
-    if not data or "voter_id" not in data:
-        return jsonify({"error": "Missing voter_id"}), 400
-
-    voter_id = data["voter_id"]
-
-    if voter_id not in state.received_votes:
-        return jsonify({"error": "No vote found for voter"}), 404
-
-    # With the new system, the proof was already verified
-    logger.info(f"ZKP finish endpoint called for {voter_id} (proof already verified)")
-    return jsonify({
-        "status": "success",
-        "message": "Proof already verified during vote submission"
-    }), 200
 
 
 @app.route("/get_voters_status", methods=["GET"])
@@ -286,7 +256,7 @@ def get_voters_status():
         status[voter_id] = {
             "has_voted": state.has_voter_voted(voter_id),
             "has_commitment": voter_id in state.received_commitments,
-            "has_zkp": voter_id in state.proof_sessions
+            # "has_zkp": voter_id in state.proof_sessions
         }
 
     return jsonify({
